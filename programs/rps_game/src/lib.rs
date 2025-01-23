@@ -1,12 +1,17 @@
 // Import dependencies
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::{program::invoke, system_instruction};
+use anchor_lang::solana_program::{program::invoke, program::invoke_signed, system_instruction};
 use sha2::{Digest, Sha256};
 
 // ------------------------------------
 // Declare the program ID
 // ------------------------------------
 declare_id!("28AfQg9jGzkW9tJw9zQ857ncvuUnnNHE4vGb4pLpPLRM");
+
+// ------------------------------------
+// Constants
+// ------------------------------------
+const GAME_SEED: &[u8] = b"game";
 
 // ------------------------------------
 // The Program Module
@@ -34,6 +39,7 @@ pub mod rps_game {
         game_account.joiner_move_revealed = None;
         game_account.wager = wager;
         game_account.status = GameStatus::Open;
+        game_account.bump = ctx.bumps.game_account; // Corrected bump access
 
         // -----------------------------------
         // Transfer SOL = 'wager' lamports
@@ -108,22 +114,23 @@ pub mod rps_game {
         original_move: u8, // 0=Rock,1=Paper,2=Scissors
         salt: String,
     ) -> Result<()> {
-
-    
-        // Collect all necessary AccountInfo references first
+        // Step 1: Extract immutable data first
+        let game_account_key = ctx.accounts.game_account.key(); // Corrected method call
         let game_account_info = ctx.accounts.game_account.to_account_info();
+
+        // Clone AccountInfos to use later without borrow conflicts
         let house_info = ctx.accounts.house.to_account_info();
         let creator_info = ctx.accounts.creator.to_account_info();
         let joiner_info = ctx.accounts.joiner.to_account_info();
         let system_program_info = ctx.accounts.system_program.to_account_info();
 
-        // Now, borrow game_account mutably
+        // Step 2: Create a mutable reference to game_account
         let game_account = &mut ctx.accounts.game_account;
-        
+
         msg!("Game Account Before Mutation: {:?}", game_account);
-        
+
         require!(
-            game_account.status == GameStatus::Committed,
+            matches!(game_account.status, GameStatus::Committed),
             ErrorCode::InvalidGameStatus
         );
 
@@ -184,20 +191,30 @@ pub mod rps_game {
             // --------------
             // Transfer logic
             // --------------
+            // Define seeds and bump for PDA signing
+            let seeds = &[
+                GAME_SEED,
+                game_account.creator.as_ref(),
+                &game_account.wager.to_le_bytes(),
+                &[game_account.bump],
+            ];
+            let signer_seeds = &[&seeds[..]];
+
             // Transfer house fee
             if house_fee > 0 {
                 let ix = system_instruction::transfer(
-                    &game_account.key(),
+                    &game_account_key,
                     &house_info.key(),
                     house_fee,
                 );
-                invoke(
+                invoke_signed(
                     &ix,
                     &[
                         game_account_info.clone(),
                         house_info.clone(),
                         system_program_info.clone(),
                     ],
+                    signer_seeds,
                 )?;
             }
 
@@ -205,32 +222,34 @@ pub mod rps_game {
             match rps_result {
                 RPSResult::CreatorWins => {
                     let ix = system_instruction::transfer(
-                        &game_account.key(),
+                        &game_account_key,
                         &creator_info.key(),
                         payout,
                     );
-                    invoke(
+                    invoke_signed(
                         &ix,
                         &[
                             game_account_info.clone(),
                             creator_info.clone(),
                             system_program_info.clone(),
                         ],
+                        signer_seeds,
                     )?;
                 }
                 RPSResult::JoinerWins => {
                     let ix = system_instruction::transfer(
-                        &game_account.key(),
+                        &game_account_key,
                         &joiner_info.key(),
                         payout,
                     );
-                    invoke(
+                    invoke_signed(
                         &ix,
                         &[
                             game_account_info.clone(),
                             joiner_info.clone(),
                             system_program_info.clone(),
                         ],
+                        signer_seeds,
                     )?;
                 }
                 RPSResult::Tie => {
@@ -238,40 +257,42 @@ pub mod rps_game {
                     let half_payout = payout / 2;
 
                     let ix_creator = system_instruction::transfer(
-                        &game_account.key(),
+                        &game_account_key,
                         &creator_info.key(),
                         half_payout,
                     );
                     let ix_joiner = system_instruction::transfer(
-                        &game_account.key(),
+                        &game_account_key,
                         &joiner_info.key(),
                         half_payout,
                     );
 
-                    invoke(
+                    invoke_signed(
                         &ix_creator,
                         &[
                             game_account_info.clone(),
                             creator_info.clone(),
                             system_program_info.clone(),
                         ],
+                        signer_seeds,
                     )?;
-                    invoke(
+                    invoke_signed(
                         &ix_joiner,
                         &[
                             game_account_info.clone(),
                             joiner_info.clone(),
                             system_program_info.clone(),
                         ],
+                        signer_seeds,
                     )?;
                 }
             }
 
             // Mark the game as ended
             game_account.status = GameStatus::Ended;
-
         }
-        msg!("Game Account After Mutation: {:?}", game_account);        
+
+        msg!("Game Account After Mutation: {:?}", game_account);
         Ok(())
     }
 }
@@ -296,6 +317,7 @@ pub struct GameState {
 
     pub wager: u64,                      // Wager amount in lamports
     pub status: GameStatus,              // Current status of the game
+    pub bump: u8,                        // Bump for PDA
 }
 
 // GameStatus enum
@@ -306,17 +328,17 @@ pub enum GameStatus {
     Ended,     // Game has ended
 }
 
-// Update MAX_SIZE for the GameState
 impl GameState {
     pub const MAX_SIZE: usize =
         32 +            // creator
         1 + 32 +        // opponent (Option<Pubkey>)
         32 +            // creator_move_hashed
         32 +            // joiner_move_hashed
-        1 +             // creator_move_revealed (Option<u8>)
-        1 +             // joiner_move_revealed (Option<u8>)
+        2 +             // creator_move_revealed (Option<u8>)
+        2 +             // joiner_move_revealed (Option<u8>)
         8 +             // wager
-        1;              // status
+        1 +             // status
+        1;              // bump
 }
 
 // ------------------------------------
@@ -326,8 +348,10 @@ impl GameState {
 #[instruction(creator_move_hashed: [u8; 32], wager: u64)]
 pub struct CreateGame<'info> {
     #[account(
-        init, 
-        payer = creator, 
+        init,
+        payer = creator,
+        seeds = [GAME_SEED, creator.key().as_ref(), &wager.to_le_bytes()],
+        bump,
         space = 8 + GameState::MAX_SIZE
     )]
     pub game_account: Account<'info, GameState>,
@@ -351,7 +375,11 @@ pub struct JoinGame<'info> {
 
 #[derive(Accounts)]
 pub struct RevealMove<'info> {
-    #[account(mut)]
+    #[account(
+        mut,
+        seeds = [GAME_SEED, creator.key().as_ref(), &game_account.wager.to_le_bytes()],
+        bump = game_account.bump
+    )]
     pub game_account: Account<'info, GameState>,
 
     #[account(mut)]
