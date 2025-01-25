@@ -8,7 +8,7 @@ import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import { BN } from "bn.js";
 import * as crypto from "crypto"; // Import crypto for hashing
 
-describe("rps_game - Create, Join, and Select Move", () => {
+describe("rps_game - Create, Join, Select Move, and Ready Up", () => {
   // Configure the client to use the local cluster.
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
@@ -330,6 +330,221 @@ describe("rps_game - Create, Join, and Select Move", () => {
           err.message,
           "Unauthorized",
           "The error message should contain 'Unauthorized'"
+        );
+      }
+    });
+  });
+
+  describe("Ready Up", () => {
+    it("Creator ready up successfully after selecting a move", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+
+      // Invoke the ready_up instruction as creator
+      await program.rpc.readyUp({
+        accounts: {
+          gameAccount: gameAccountPda,
+          player: creator.publicKey,
+          systemProgram: SystemProgram.programId,
+        },
+        signers: [creator],
+      });
+
+      // Fetch the account and assert the ready status
+      const gameAccountData = await program.account.gameState.fetch(gameAccountPda);
+      
+
+      // Inside the failing test
+      console.log("Game Status:", gameAccountData.status);
+
+      // Assertions
+      assert.equal(
+        gameAccountData.creatorReady,
+        true,
+        "Creator should be marked as ready"
+      );
+      assert.equal(
+        gameAccountData.joinerReady,
+        false,
+        "Joiner should not be marked as ready yet"
+      );
+      assert.deepEqual(
+        gameAccountData.status,
+        { committed: {} },
+        "Game status should remain Committed until both players are ready"
+      );
+    });
+
+    it("Joiner ready up successfully after selecting a move", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+
+      // Invoke the ready_up instruction as joiner
+      await program.rpc.readyUp({
+        accounts: {
+          gameAccount: gameAccountPda,
+          player: joiner.publicKey,
+          systemProgram: SystemProgram.programId,
+        },
+        signers: [joiner],
+      });
+
+      // Fetch the account and assert the ready status and game status
+      const gameAccountData = await program.account.gameState.fetch(gameAccountPda);
+
+      // Assertions
+      assert.equal(
+        gameAccountData.creatorReady,
+        true,
+        "Creator should be marked as ready"
+      );
+      assert.equal(
+        gameAccountData.joinerReady,
+        true,
+        "Joiner should be marked as ready"
+      );
+      assert.deepEqual(
+        gameAccountData.status,
+        { ended: {} },
+        "Game status should be Ended after both players are ready"
+      );
+    });
+
+    it("Player cannot ready up without selecting a move", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+
+      // Create a new game for isolation
+      const newCreator = Keypair.generate();
+      const newJoiner = Keypair.generate();
+
+      // Airdrop SOL to new creator and new joiner
+      const airdropSignatureNewCreator = await provider.connection.requestAirdrop(
+        newCreator.publicKey,
+        2 * anchor.web3.LAMPORTS_PER_SOL
+      );
+      await provider.connection.confirmTransaction(airdropSignatureNewCreator, "confirmed");
+
+      const airdropSignatureNewJoiner = await provider.connection.requestAirdrop(
+        newJoiner.publicKey,
+        2 * anchor.web3.LAMPORTS_PER_SOL
+      );
+      await provider.connection.confirmTransaction(airdropSignatureNewJoiner, "confirmed");
+
+      // Find PDA for the new game
+      const [newGameAccountPda, newBump] = await findGameAccountPda(newCreator, wager, program.programId);
+
+      // Create the new game
+      await program.rpc.createGame(
+        new BN(wager),
+        {
+          accounts: {
+            gameAccount: newGameAccountPda,
+            creator: newCreator.publicKey,
+            systemProgram: SystemProgram.programId,
+          },
+          signers: [newCreator],
+        }
+      );
+
+      // Join the new game
+      await program.rpc.joinGame({
+        accounts: {
+          gameAccount: newGameAccountPda,
+          joiner: newJoiner.publicKey,
+          systemProgram: SystemProgram.programId,
+        },
+        signers: [newJoiner],
+      });
+
+      // Attempt to ready up as creator without selecting a move
+      try {
+        await program.rpc.readyUp({
+          accounts: {
+            gameAccount: newGameAccountPda,
+            player: newCreator.publicKey,
+            systemProgram: SystemProgram.programId,
+          },
+          signers: [newCreator],
+        });
+        assert.fail("The transaction should have failed because the creator has not selected a move");
+      } catch (err: any) {
+        // Assert that the error is the expected one
+        assert.include(
+          err.message,
+          "MoveNotSelected",
+          "The error message should contain 'MoveNotSelected'"
+        );
+      }
+    });
+
+    it("Unauthorized user cannot ready up", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+
+      // Generate a new keypair for unauthorized user
+      const unauthorizedUser = Keypair.generate();
+
+      // Airdrop SOL to the unauthorized user
+      const airdropSignatureUnauthorized = await provider.connection.requestAirdrop(
+        unauthorizedUser.publicKey,
+        anchor.web3.LAMPORTS_PER_SOL
+      );
+      await provider.connection.confirmTransaction(airdropSignatureUnauthorized, "confirmed");
+
+      try {
+        // Attempt to invoke the ready_up instruction as unauthorized user
+        await program.rpc.readyUp({
+          accounts: {
+            gameAccount: gameAccountPda,
+            player: unauthorizedUser.publicKey,
+            systemProgram: SystemProgram.programId,
+          },
+          signers: [unauthorizedUser],
+        });
+        assert.fail("The transaction should have failed because the user is unauthorized");
+      } catch (err: any) {
+        // Assert that the error is the expected one
+        assert.include(
+          err.message,
+          "Unauthorized",
+          "The error message should contain 'Unauthorized'"
+        );
+      }
+    });
+
+    it("Cannot ready up after the game has ended", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+
+      // Attempt to ready up again as creator after the game has ended
+      try {
+        await program.rpc.readyUp({
+          accounts: {
+            gameAccount: gameAccountPda,
+            player: creator.publicKey,
+            systemProgram: SystemProgram.programId,
+          },
+          signers: [creator],
+        });
+
+        const gameAccountData = await program.account.gameState.fetch(gameAccountPda);
+        console.log("Game Status:", gameAccountData.status);
+
+        assert.fail("The transaction should have failed because the game has already ended");
+      } catch (err: any) {
+        // Assert that the error is the expected one
+        assert.include(
+          err.message,
+          "GameAlreadyEnded",
+          "The error message should contain 'GameAlreadyEnded'"
         );
       }
     });

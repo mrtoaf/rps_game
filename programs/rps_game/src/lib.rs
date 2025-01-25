@@ -134,7 +134,17 @@ pub mod rps_game {
     pub fn ready_up(ctx: Context<ReadyUp>) -> Result<()> {
         let game_account = &mut ctx.accounts.game_account;
         let player_key = ctx.accounts.player.key();
-
+        
+        if player_key != game_account.creator && Some(player_key) != game_account.opponent {
+            return err!(ErrorCode::Unauthorized);
+        }
+        
+        // Prevent ready_up if the game has already ended
+        match game_account.status {
+            GameStatus::Ended => return err!(ErrorCode::GameAlreadyEnded),
+            _ => {}
+        }
+        
         // Check if the player has selected a move
         if player_key == game_account.creator {
             require!(
@@ -151,7 +161,7 @@ pub mod rps_game {
         } else {
             return err!(ErrorCode::Unauthorized);
         }
-
+    
         // Check if both players are ready
         if game_account.creator_ready && game_account.joiner_ready {
             // Both players are ready; determine the winner
@@ -162,7 +172,7 @@ pub mod rps_game {
             handle_payout(winner, game_account)?;
             game_account.status = GameStatus::Ended;
         }
-
+    
         Ok(())
     }
 }
@@ -288,4 +298,7 @@ pub enum ErrorCode {
 
     #[msg("Unauthorized action.")]
     Unauthorized,
+
+    #[msg("Game has already ended.")]
+    GameAlreadyEnded,
 }
