@@ -6,8 +6,9 @@ import { RpsGame } from "../target/types/rps_game"; // Ensure this path is corre
 import { assert } from "chai";
 import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import { BN } from "bn.js";
+import * as crypto from "crypto"; // Import crypto for hashing
 
-describe("rps_game - Create and Join Game", () => {
+describe("rps_game - Create, Join, and Select Move", () => {
   // Configure the client to use the local cluster.
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
@@ -32,6 +33,14 @@ describe("rps_game - Create and Join Game", () => {
       [Buffer.from("game"), creator.publicKey.toBuffer(), wagerBuffer],
       programId
     );
+  };
+
+  // Helper function to compute SHA-256 hash
+  const hashMove = (original_move: number, salt: string): Buffer => {
+    const hash = crypto.createHash("sha256");
+    hash.update(Buffer.from([original_move]));
+    hash.update(Buffer.from(salt));
+    return hash.digest();
   };
 
   before(async () => {
@@ -204,6 +213,123 @@ describe("rps_game - Create and Join Game", () => {
           err.message,
           "GameNotOpen",
           "The error message should contain 'GameNotOpen'"
+        );
+      }
+    });
+  });
+
+  describe("Select Move", () => {
+    it("Creator selects their move successfully!", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+      const original_move = 0; // 0 = Rock
+      const salt = "creator_salt";
+
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+
+      // Invoke the select_move instruction as creator
+      await program.rpc.selectMove(
+        original_move,
+        salt,
+        {
+          accounts: {
+            gameAccount: gameAccountPda,
+            player: creator.publicKey,
+            systemProgram: SystemProgram.programId,
+          },
+          signers: [creator],
+        }
+      );
+
+      // Fetch the account and assert the move is recorded correctly
+      const gameAccountData = await program.account.gameState.fetch(gameAccountPda);
+
+      // Compute expected hash
+      const expectedHash = hashMove(original_move, salt);
+
+      // Assertions
+      assert.deepEqual(
+        gameAccountData.creatorMoveHashed,
+        Array.from(expectedHash),
+        "Creator's hashed move does not match expected hash"
+      );
+    });
+
+    it("Joiner selects their move successfully!", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+      const original_move = 1; // 1 = Paper
+      const salt = "joiner_salt";
+
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+
+      // Invoke the select_move instruction as joiner
+      await program.rpc.selectMove(
+        original_move,
+        salt,
+        {
+          accounts: {
+            gameAccount: gameAccountPda,
+            player: joiner.publicKey,
+            systemProgram: SystemProgram.programId,
+          },
+          signers: [joiner],
+        }
+      );
+
+      // Fetch the account and assert the move is recorded correctly
+      const gameAccountData = await program.account.gameState.fetch(gameAccountPda);
+
+      // Compute expected hash
+      const expectedHash = hashMove(original_move, salt);
+
+      // Assertions
+      assert.deepEqual(
+        gameAccountData.joinerMoveHashed,
+        Array.from(expectedHash),
+        "Joiner's hashed move does not match expected hash"
+      );
+    });
+
+    it("Unauthorized user cannot select a move", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+      const original_move = 2; // 2 = Scissors
+      const salt = "unauthorized_salt";
+
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+
+      // Generate a new keypair for unauthorized user
+      const unauthorizedUser = Keypair.generate();
+
+      // Airdrop SOL to the unauthorized user
+      const airdropSignatureUnauthorized = await provider.connection.requestAirdrop(
+        unauthorizedUser.publicKey,
+        anchor.web3.LAMPORTS_PER_SOL
+      );
+      await provider.connection.confirmTransaction(airdropSignatureUnauthorized, "confirmed");
+
+      try {
+        // Attempt to invoke the select_move instruction as unauthorized user
+        await program.rpc.selectMove(
+          original_move,
+          salt,
+          {
+            accounts: {
+              gameAccount: gameAccountPda,
+              player: unauthorizedUser.publicKey,
+              systemProgram: SystemProgram.programId,
+            },
+            signers: [unauthorizedUser],
+          }
+        );
+        assert.fail("The transaction should have failed because the user is unauthorized");
+      } catch (err: any) {
+        // Assert that the error is the expected one
+        assert.include(
+          err.message,
+          "Unauthorized",
+          "The error message should contain 'Unauthorized'"
         );
       }
     });
