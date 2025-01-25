@@ -1,12 +1,13 @@
+// tests/rps_game.test.ts
+
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { RpsGame } from "../target/types/rps_game";
+import { RpsGame } from "../target/types/rps_game"; // Ensure this path is correct
 import { assert } from "chai";
-import { Keypair, PublicKey } from "@solana/web3.js";
-import { sha256 } from "js-sha256";
-import { BN } from "bn.js"; // Import BN for big number handling
+import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import { BN } from "bn.js";
 
-describe("rps_game", () => {
+describe("rps_game - Create and Join Game", () => {
   // Configure the client to use the local cluster.
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
@@ -18,184 +19,193 @@ describe("rps_game", () => {
   const joiner = Keypair.generate();
   const house = Keypair.generate(); // House account can be a Keypair or a predefined account
 
-  // Shared salt variables
-  let creatorSalt: string;
-  let joinerSalt: string;
-
   // Helper function to derive PDA
   const findGameAccountPda = async (
-    creator: anchor.web3.Keypair,
+    creator: Keypair,
     wager: number,
-    programId: anchor.web3.PublicKey
-  ): Promise<[anchor.web3.PublicKey, number]> => {
+    programId: PublicKey
+  ): Promise<[PublicKey, number]> => {
     const wagerBn = new BN(wager);
     const wagerBuffer = wagerBn.toArrayLike(Buffer, "le", 8); // 8-byte little-endian
 
-    return anchor.web3.PublicKey.findProgramAddress(
-      [
-        Buffer.from("game"),
-        creator.publicKey.toBuffer(),
-        wagerBuffer,
-      ],
+    return PublicKey.findProgramAddress(
+      [Buffer.from("game"), creator.publicKey.toBuffer(), wagerBuffer],
       programId
     );
   };
 
   before(async () => {
-    // Airdrop SOL to creator and joiner for tests
+    // Airdrop SOL to creator, joiner, and house for tests
+    const airdropAmountCreator = 2 * anchor.web3.LAMPORTS_PER_SOL;
     const airdropSignatureCreator = await provider.connection.requestAirdrop(
       creator.publicKey,
-      2 * anchor.web3.LAMPORTS_PER_SOL
+      airdropAmountCreator
     );
     await provider.connection.confirmTransaction(airdropSignatureCreator, "confirmed");
 
+    const airdropAmountJoiner = 2 * anchor.web3.LAMPORTS_PER_SOL;
     const airdropSignatureJoiner = await provider.connection.requestAirdrop(
       joiner.publicKey,
-      2 * anchor.web3.LAMPORTS_PER_SOL
+      airdropAmountJoiner
     );
     await provider.connection.confirmTransaction(airdropSignatureJoiner, "confirmed");
 
+    const airdropAmountHouse = 1 * anchor.web3.LAMPORTS_PER_SOL;
     const airdropSignatureHouse = await provider.connection.requestAirdrop(
       house.publicKey,
-      1 * anchor.web3.LAMPORTS_PER_SOL
+      airdropAmountHouse
     );
     await provider.connection.confirmTransaction(airdropSignatureHouse, "confirmed");
   });
 
-  it("Is initialized!", async () => {
-    const wager = 100_000_000; // Example wager in lamports
-    const creatorMove = 0; // Rock
-    creatorSalt = "random_salt"; // Assigning salt
+  describe("Create Game", () => {
+    it("Creates a new game successfully!", async () => {
+      const wager = 100_000_000; // Example wager in lamports (0.1 SOL)
 
-    // Compute creator's hashed move
-    const creatorHash = sha256.create();
-    creatorHash.update(Buffer.from([creatorMove]));
-    creatorHash.update(Buffer.from(creatorSalt));
-    const creator_move_hashed = creatorHash.array(); // Uint8Array
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
 
-    // Find PDA using helper function
-    const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+      // Invoke the create_game instruction
+      await program.rpc.createGame(
+        new BN(wager), // Wager as BN
+        {
+          accounts: {
+            gameAccount: gameAccountPda,
+            creator: creator.publicKey,
+            systemProgram: SystemProgram.programId,
+          },
+          signers: [creator],
+        }
+      );
 
-    await program.rpc.createGame(
-      creator_move_hashed,
-      new BN(wager),
-      {
-        accounts: {
-          gameAccount: gameAccountPda,
-          creator: creator.publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
-        },
-        signers: [creator],
-      }
-    );
+      // Fetch the account and assert initialization
+      const gameAccountData = await program.account.gameState.fetch(gameAccountPda);
 
-    // Fetch the account and assert initialization
-    const gameAccount = await program.account.gameState.fetch(gameAccountPda);
-    assert.equal(gameAccount.creator.toBase58(), creator.publicKey.toBase58());
-    assert.isNull(gameAccount.opponent);
-    assert.isDefined(gameAccount.status.open); // Corrected assertion
-    assert.equal(gameAccount.bump, bump); // Verify bump consistency
+      // Assertions to verify the game account is initialized correctly
+      assert.equal(
+        gameAccountData.creator.toBase58(),
+        creator.publicKey.toBase58(),
+        "Creator address mismatch"
+      );
+      assert.isNull(gameAccountData.opponent, "Opponent should be null initially");
+      assert.deepEqual(
+        gameAccountData.creatorMoveHashed,
+        Array(32).fill(0),
+        "Creator move hashed should be initialized to zeroes"
+      );
+      assert.deepEqual(
+        gameAccountData.joinerMoveHashed,
+        Array(32).fill(0),
+        "Joiner move hashed should be initialized to zeroes"
+      );
+      assert.equal(gameAccountData.creatorReady, false, "Creator should not be ready initially");
+      assert.equal(gameAccountData.joinerReady, false, "Joiner should not be ready initially");
+      assert.equal(gameAccountData.wager.toNumber(), wager, "Wager amount mismatch");
+      assert.deepEqual(
+        gameAccountData.status,
+        { open: {} },
+        "Game status should be Open"
+      );
+      assert.equal(gameAccountData.bump, bump, "Bump seed mismatch");
 
-    // Optional: Log PDA and bump for verification
-    console.log("Game Account PDA:", gameAccountPda.toBase58());
-    console.log("Stored Bump in Account:", gameAccount.bump);
+      // Optional: Log PDA and bump for verification
+      console.log("Game Account PDA:", gameAccountPda.toBase58());
+      console.log("Stored Bump in Account:", gameAccountData.bump);
+    });
   });
 
-  it("Join Game test", async () => {
-    const wager = 100_000_000; // Must match the wager used in createGame
-    const joinerMove = 2; // Scissors
-    joinerSalt = "another_random_salt"; // Assigning salt
+  describe("Join Game", () => {
+    it("Joins an existing game successfully!", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
 
-    // Compute joiner's hashed move
-    const joinerHash = sha256.create();
-    joinerHash.update(Buffer.from([joinerMove]));
-    joinerHash.update(Buffer.from(joinerSalt));
-    const joiner_move_hashed = joinerHash.array(); // Uint8Array
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
 
-    // Find PDA using helper function
-    const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+      // Fetch initial balances for verification
+      const initialGameAccountBalance = await provider.connection.getBalance(gameAccountPda);
+      const initialJoinerBalance = await provider.connection.getBalance(joiner.publicKey);
 
-    await program.rpc.joinGame(
-      joiner_move_hashed,
-      {
+      // Invoke the join_game instruction
+      await program.rpc.joinGame({
         accounts: {
           gameAccount: gameAccountPda,
           joiner: joiner.publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
+          systemProgram: SystemProgram.programId,
         },
         signers: [joiner],
+      });
+
+      // Fetch the account and assert joining
+      const gameAccountData = await program.account.gameState.fetch(gameAccountPda);
+
+      // Assertions to verify the game account is updated correctly
+      assert.equal(
+        gameAccountData.opponent.toBase58(),
+        joiner.publicKey.toBase58(),
+        "Opponent address mismatch"
+      );
+      assert.deepEqual(
+        gameAccountData.status,
+        { committed: {} },
+        "Game status should be Committed"
+      );
+
+      // Verify the transfer of lamports
+      const finalGameAccountBalance = await provider.connection.getBalance(gameAccountPda);
+      const finalJoinerBalance = await provider.connection.getBalance(joiner.publicKey);
+
+      assert.equal(
+        finalGameAccountBalance,
+        initialGameAccountBalance + wager,
+        "Game account balance should increase by wager"
+      );
+      assert.equal(
+        finalJoinerBalance,
+        initialJoinerBalance - wager,
+        "Joiner's balance should decrease by wager"
+      );
+
+      // Optional: Log balances for verification
+      console.log("Initial Game Account Balance:", initialGameAccountBalance);
+      console.log("Final Game Account Balance:", finalGameAccountBalance);
+      console.log("Initial Joiner Balance:", initialJoinerBalance);
+      console.log("Final Joiner Balance:", finalJoinerBalance);
+    });
+
+    it("Fails to join a game that's already committed", async () => {
+      const wager = 100_000_000; // Must match the wager used in createGame
+
+      // Find PDA using helper function
+      const [gameAccountPda, bump] = await findGameAccountPda(creator, wager, program.programId);
+
+      // Attempt to join the game again with a different joiner
+      const secondJoiner = Keypair.generate();
+
+      // Airdrop SOL to the second joiner
+      const airdropSignatureSecondJoiner = await provider.connection.requestAirdrop(
+        secondJoiner.publicKey,
+        anchor.web3.LAMPORTS_PER_SOL
+      );
+      await provider.connection.confirmTransaction(airdropSignatureSecondJoiner, "confirmed");
+
+      try {
+        await program.rpc.joinGame({
+          accounts: {
+            gameAccount: gameAccountPda,
+            joiner: secondJoiner.publicKey,
+            systemProgram: SystemProgram.programId,
+          },
+          signers: [secondJoiner],
+        });
+        assert.fail("The transaction should have failed because the game is not open");
+      } catch (err: any) {
+        // Assert that the error is the expected one
+        assert.include(
+          err.message,
+          "GameNotOpen",
+          "The error message should contain 'GameNotOpen'"
+        );
       }
-    );
-
-    // Fetch the account and assert joining
-    const gameAccount = await program.account.gameState.fetch(gameAccountPda);
-    assert.equal(gameAccount.opponent?.toBase58(), joiner.publicKey.toBase58());
-    assert.isDefined(gameAccount.status.committed); // Corrected assertion
-
-    // Optional: Log PDA for verification
-    console.log("Game Account PDA after joining:", gameAccountPda.toBase58());
-  });
-
-  it("Reveal Move test (Creator wins Rock vs Scissors)", async () => {
-    const original_move_creator = 0; // Rock
-    const original_move_joiner = 2; // Scissors
-
-    // Use the same salts as in previous tests
-    // Creator reveals move with creatorSalt
-    const creatorHash = sha256.create();
-    creatorHash.update(Buffer.from([original_move_creator]));
-    creatorHash.update(Buffer.from(creatorSalt));
-    const creator_move_revealed = creatorHash.array(); // Uint8Array
-
-    // Joiner reveals move with joinerSalt
-    const joinerHash = sha256.create();
-    joinerHash.update(Buffer.from([original_move_joiner]));
-    joinerHash.update(Buffer.from(joinerSalt));
-    const joiner_move_revealed = joinerHash.array(); // Uint8Array
-
-    // Find PDA using helper function
-    const [gameAccountPda, bump] = await findGameAccountPda(creator, 100_000_000, program.programId);
-
-    // Reveal creator's move
-    await program.rpc.revealMove(
-      original_move_creator,
-      creatorSalt, // Use the same salt used during creation
-      {
-        accounts: {
-          gameAccount: gameAccountPda,
-          player: creator.publicKey,
-          house: house.publicKey,
-          creator: creator.publicKey,
-          joiner: joiner.publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
-        },
-        signers: [creator],
-      }
-    );
-
-    // Reveal joiner's move
-    await program.rpc.revealMove(
-      original_move_joiner,
-      joinerSalt, // Use the same salt used during joining
-      {
-        accounts: {
-          gameAccount: gameAccountPda,
-          player: joiner.publicKey,
-          house: house.publicKey,
-          creator: creator.publicKey,
-          joiner: joiner.publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
-        },
-        signers: [joiner],
-      }
-    );
-
-    // Fetch the account and assert the game has ended
-    const gameAccount = await program.account.gameState.fetch(gameAccountPda);
-    assert.isDefined(gameAccount.status.ended); // Corrected assertion
-    assert.deepEqual(gameAccount.status, { ended: {} }); // Deep equality for enum
-
-    // Optional: Log game status for verification
-    console.log("Game Status after reveal:", gameAccount.status);
+    });
   });
 });
